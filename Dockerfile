@@ -14,4 +14,5 @@ RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download
 
 EXPOSE 8080
 
+ENTRYPOINT []
 CMD ["vllm", "serve", "zai-org/GLM-OCR", "--allowed-local-media-path", "/", "--port", "8080"]
