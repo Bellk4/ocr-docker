@@ -11,6 +11,10 @@ RUN pip uninstall -y transformers || true \
 # Pre-download model weights into the image so cold starts don't hit HuggingFace
 ENV HF_HOME=/root/.cache/huggingface
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
+ENV HF_HUB_OFFLINE=1
+
+# Persist vLLM compile cache on network volume to speed up cold starts
+ENV VLLM_CACHE_ROOT=/runpod-volume/vllm-cache
 
 EXPOSE 8080
 
