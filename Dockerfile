@@ -10,7 +10,7 @@ RUN pip uninstall -y transformers || true \
 
 # Pre-download model weights into the image so cold starts don't hit HuggingFace
 ENV HF_HOME=/root/.cache/huggingface
-RUN huggingface-cli download zai-org/GLM-OCR
+RUN python -m huggingface_hub.cli download zai-org/GLM-OCR
 
 EXPOSE 8080
 
