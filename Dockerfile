@@ -4,9 +4,10 @@ FROM vllm/vllm-openai:nightly
 RUN apt-get update && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
-# Install newer Transformers so GLM-OCR is recognized
+# Install newer Transformers so GLM-OCR is recognized, plus RunPod SDK
 RUN pip uninstall -y transformers || true \
- && pip install -U git+https://github.com/huggingface/transformers.git
+ && pip install -U git+https://github.com/huggingface/transformers.git \
+ && pip install runpod requests
 
 # Pre-download model weights into the image so cold starts don't hit HuggingFace
 ENV HF_HOME=/root/.cache/huggingface
@@ -16,7 +17,9 @@ ENV HF_HUB_OFFLINE=1
 # Persist vLLM compile cache on network volume to speed up cold starts
 ENV VLLM_CACHE_ROOT=/runpod-volume/vllm-cache
 
+COPY handler.py /handler.py
+
 EXPOSE 8080
 
 ENTRYPOINT []
-CMD ["vllm", "serve", "zai-org/GLM-OCR", "--allowed-local-media-path", "/", "--port", "8080"]
+CMD ["python3", "-u", "/handler.py"]
