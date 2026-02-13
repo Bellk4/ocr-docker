@@ -8,6 +8,7 @@ then forwards incoming RunPod jobs to the local OpenAI-compatible API.
 import os
 import time
 import base64
+import tempfile
 import subprocess
 import threading
 import logging
@@ -31,6 +32,9 @@ SPECULATIVE_CONFIG = os.getenv(
 )
 ENFORCE_EAGER = os.getenv("ENFORCE_EAGER", "0").lower() in {"1", "true", "yes"}
 MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "2000"))
+USE_GLMOCR_SDK = os.getenv("USE_GLMOCR_SDK", "1").lower() in {"1", "true", "yes"}
+
+OCR_PARSER = None
 
 
 def stream_output(pipe):
@@ -95,6 +99,27 @@ def wait_for_vllm(timeout=600):
     raise TimeoutError(f"vLLM did not start within {timeout}s")
 
 
+def init_glmocr_sdk():
+    """Initialize glm-ocr SDK parser if available."""
+    if not USE_GLMOCR_SDK:
+        log.info("GLM-OCR SDK disabled by USE_GLMOCR_SDK")
+        return None
+
+    try:
+        from glmocr import GlmOcr
+    except Exception as exc:
+        log.warning("Failed to import glm-ocr SDK: %s", exc)
+        return None
+
+    try:
+        parser = GlmOcr()
+        log.info("GLM-OCR SDK initialized")
+        return parser
+    except Exception as exc:
+        log.warning("Failed to initialize glm-ocr SDK: %s", exc)
+        return None
+
+
 def _extract_image_url(content_part):
     """Return image URL string from an OpenAI content part."""
     if not isinstance(content_part, dict):
@@ -117,6 +142,48 @@ def _set_image_url(content_part, new_url):
         image_url["url"] = new_url
     else:
         content_part["image_url"] = {"url": new_url}
+
+
+def _extract_job_image_and_prompt(job_input):
+    """Extract first image URL/path and prompt text from supported payload shapes."""
+    image_ref = None
+    prompt_parts = []
+
+    if isinstance(job_input, str):
+        return job_input, ""
+
+    if not isinstance(job_input, dict):
+        return None, ""
+
+    image_ref = job_input.get("url") or job_input.get("image")
+    prompt = job_input.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        prompt_parts.append(prompt.strip())
+
+    messages = job_input.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                if content.strip():
+                    prompt_parts.append(content.strip())
+                continue
+            if not isinstance(content, list):
+                continue
+
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if image_ref is None:
+                    image_ref = _extract_image_url(part)
+                if part.get("type") == "text":
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        prompt_parts.append(text.strip())
+
+    return image_ref, "\n".join(prompt_parts).strip()
 
 
 def _read_image_bytes(url):
@@ -166,6 +233,126 @@ def _resize_image_to_data_url(image_bytes, max_side):
 
         encoded = base64.b64encode(out.getvalue()).decode("ascii")
         return f"data:{mime};base64,{encoded}", (width, height), new_size
+
+
+def _resize_image_to_file_path(image_bytes, max_side):
+    """
+    Resize image to MAX_IMAGE_SIDE and store in a temporary local file.
+    Returns (path_or_none, old_size, new_size).
+    """
+    with Image.open(BytesIO(image_bytes)) as img:
+        width, height = img.size
+        longest = max(width, height)
+        if longest <= max_side:
+            return None, (width, height), (width, height)
+
+        ratio = max_side / float(longest)
+        new_size = (
+            max(1, int(width * ratio)),
+            max(1, int(height * ratio)),
+        )
+        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+
+        has_alpha = "A" in resized.getbands()
+        if has_alpha:
+            suffix = ".png"
+            save_kwargs = {"format": "PNG", "optimize": True}
+        else:
+            if resized.mode not in {"RGB", "L"}:
+                resized = resized.convert("RGB")
+            suffix = ".jpg"
+            save_kwargs = {"format": "JPEG", "quality": 90, "optimize": True}
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=suffix,
+            prefix="glmocr_",
+            delete=False,
+        )
+        with tmp:
+            resized.save(tmp, **save_kwargs)
+        return tmp.name, (width, height), new_size
+
+
+def _prepare_image_for_sdk(image_ref, job_id):
+    """Return image path/url for SDK parse and list of temp files to clean up."""
+    cleanup_paths = []
+    if MAX_IMAGE_SIDE <= 0:
+        return image_ref, cleanup_paths
+
+    try:
+        image_bytes = _read_image_bytes(image_ref)
+        resized_path, old_size, new_size = _resize_image_to_file_path(
+            image_bytes, MAX_IMAGE_SIDE
+        )
+        if resized_path is None:
+            return image_ref, cleanup_paths
+
+        cleanup_paths.append(resized_path)
+        log.info(
+            "Job %s: SDK image resized from %sx%s to %sx%s",
+            job_id,
+            old_size[0],
+            old_size[1],
+            new_size[0],
+            new_size[1],
+        )
+        return resized_path, cleanup_paths
+    except Exception as exc:
+        log.warning("Job %s: SDK image resize skipped (%s)", job_id, exc)
+        return image_ref, cleanup_paths
+
+
+def _normalize_sdk_result(result):
+    """Normalize glm-ocr SDK output into stable response keys."""
+    if isinstance(result, dict):
+        layout_json = result.get("json_result") or result.get("layout_json")
+        markdown = result.get("md_result") or result.get("markdown")
+        return layout_json, markdown, result
+
+    layout_json = getattr(result, "json_result", None)
+    markdown = getattr(result, "md_result", None)
+    raw = {
+        "json_result": layout_json,
+        "md_result": markdown,
+    }
+    return layout_json, markdown, raw
+
+
+def _parse_with_sdk(job_input, job_id):
+    """Parse image with glm-ocr SDK and return structured output dict or None."""
+    if OCR_PARSER is None:
+        return None
+
+    image_ref, prompt = _extract_job_image_and_prompt(job_input)
+    if not image_ref:
+        return None
+
+    image_input, cleanup_paths = _prepare_image_for_sdk(image_ref, job_id)
+    try:
+        # Some SDK versions support prompt kwarg; fall back to image-only parse.
+        if prompt:
+            try:
+                result = OCR_PARSER.parse(image_input, prompt=prompt)
+            except TypeError:
+                result = OCR_PARSER.parse(image_input)
+        else:
+            result = OCR_PARSER.parse(image_input)
+
+        layout_json, markdown, raw = _normalize_sdk_result(result)
+        pages = len(layout_json) if isinstance(layout_json, list) else 1
+        return {
+            "layout_json": layout_json,
+            "markdown": markdown,
+            "pages": pages,
+            "raw": raw,
+        }
+    finally:
+        for path in cleanup_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def preprocess_images(job_input, job_id):
@@ -247,16 +434,31 @@ def handler(job):
     """
     job_id = job.get("id", "unknown")
     job_input = job.get("input")
+    if isinstance(job_input, dict):
+        job_input = dict(job_input)
+    elif isinstance(job_input, str):
+        pass
+    else:
+        return {
+            "error": (
+                "Invalid request format. Expected {'input': {...}} or "
+                "{'input': '<image_url_or_path>'}."
+            )
+        }
+    log.info("Job %s: received request", job_id)
+
+    sdk_result = _parse_with_sdk(job_input, job_id)
+    if sdk_result is not None:
+        log.info("Job %s: completed via glm-ocr SDK", job_id)
+        return sdk_result
+
     if not isinstance(job_input, dict):
         return {
             "error": (
-                "Invalid request format. Expected {'input': {...}} as the "
-                "job payload."
+                "No image found for glm-ocr SDK parse and input is not a "
+                "chat completions payload."
             )
         }
-
-    job_input = dict(job_input)
-    log.info("Job %s: received request", job_id)
 
     # Set model default if not provided.
     if "model" not in job_input:
@@ -301,4 +503,5 @@ def handler(job):
 if __name__ == "__main__":
     vllm_process = start_vllm()
     wait_for_vllm()
+    OCR_PARSER = init_glmocr_sdk()
     runpod.serverless.start({"handler": handler})
