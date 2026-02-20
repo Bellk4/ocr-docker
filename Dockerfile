@@ -1,36 +1,26 @@
 FROM vllm/vllm-openai:nightly
 
-# git is needed for pip install from GitHub
+# 1. システムパッケージのインストール
 RUN apt-get update && apt-get install -y --no-install-recommends git \
- && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# Install newer Transformers so GLM-OCR is recognized, plus RunPod SDK
-RUN pip uninstall -y transformers || true \
- && pip install -U git+https://github.com/huggingface/transformers.git \
- && pip install -U git+https://github.com/zai-org/glm-ocr.git \
- && pip install runpod requests pillow
+# 2. pip自体のアップグレードと基本ライブラリのインストール
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install runpod requests pillow
 
-# Pre-download model weights into the image so cold starts don't hit HuggingFace
+# 3. Transformersを最新版（GitHubメインブランチ）に入れ替え
+# vLLMが持っている古いバージョンとの競合を避けるため強制再インストール
+RUN pip uninstall -y transformers || true
+RUN pip install git+https://github.com/huggingface/transformers.git
+
+# 4. GLM-OCRのインストール
+RUN pip install git+https://github.com/zai-org/glm-ocr.git
+
+# 5. モデルの事前ダウンロード（ビルド時に同梱してコールドスタートを高速化）
 ENV HF_HOME=/root/.cache/huggingface
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
-ENV HF_HUB_OFFLINE=1
-
-# Persist vLLM compile cache on network volume to speed up cold starts
-ENV VLLM_CACHE_ROOT=/runpod-volume/vllm-cache
-ENV MAX_MODEL_LEN=16384
-ENV GPU_MEMORY_UTILIZATION=0.95
-ENV SPECULATIVE_CONFIG='{"method":"mtp","num_speculative_tokens":1}'
-ENV ENFORCE_EAGER=0
-ENV MAX_IMAGE_SIDE=2000
-ENV USE_GLMOCR_SDK=1
-
-# Force glm-ocr SDK to use local vLLM instead of MaaS.
-RUN mkdir -p /root/.config/glm-ocr \
- && printf "pipeline:\n  maas:\n    enabled: false\n  ocr_api:\n    api_host: localhost\n    api_port: 8080\n" > /root/.config/glm-ocr/config.yaml
-
-COPY handler.py /handler.py
 
 EXPOSE 8080
 
-ENTRYPOINT []
-CMD ["python3", "-u", "/handler.py"]
+# 起動コマンド
+CMD ["vllm", "serve", "zai-org/GLM-OCR", "--allowed-local-media-path", "/", "--port", "8080"]
