@@ -13,6 +13,13 @@ RUN pip uninstall -y transformers || true \
 ENV HF_HOME=/root/.cache/huggingface
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('zai-org/GLM-OCR')"
 
+# Install handler dependencies
+RUN pip install --no-cache-dir runpod pillow requests
+
+# Copy the RunPod serverless handler
+COPY handler.py /handler.py
+
 EXPOSE 8080
 
-CMD ["vllm", "serve", "zai-org/GLM-OCR", "--allowed-local-media-path", "/", "--port", "8080"]
+# handler.py starts vLLM as a subprocess, then listens for RunPod jobs
+CMD ["python3", "-u", "/handler.py"]
