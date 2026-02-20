@@ -65,14 +65,16 @@ except Exception as e:
 print("\n[2] 画像URL抽出ロジック (_extract_job_image_and_prompt)")
 if h:
     # パターン1: シンプルな url キー
-    image, prompt = h._extract_job_image_and_prompt({"url": "https://example.com/test.png"})
+    image, prompt = h._extract_job_image_and_prompt(
+        {"url": "https://example.com/test.png"})
     check("url キーから画像URL抽出", image == "https://example.com/test.png")
 
     # パターン2: messages 形式
     payload = {
         "messages": [
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}},
+                {"type": "image_url", "image_url": {
+                    "url": "https://example.com/img.jpg"}},
                 {"type": "text", "text": "OCRしてください"}
             ]}
         ]
@@ -94,7 +96,8 @@ else:
 print("\n[3] 画像リサイズロジック (_resize_image_to_data_url)")
 if h:
     from PIL import Image
-    import struct, zlib
+    import struct
+    import zlib
 
     def make_test_image(width, height):
         img = Image.new("RGB", (width, height), color=(255, 0, 0))
@@ -104,12 +107,14 @@ if h:
 
     # 小さい画像（リサイズ不要）
     small_bytes = make_test_image(100, 100)
-    data_url, old_size, new_size = h._resize_image_to_data_url(small_bytes, 2000)
+    data_url, old_size, new_size = h._resize_image_to_data_url(
+        small_bytes, 2000)
     check("小さい画像はリサイズしない", data_url is None, f"{old_size} → {new_size}")
 
     # 大きい画像（リサイズ必要）
     large_bytes = make_test_image(4000, 3000)
-    data_url, old_size, new_size = h._resize_image_to_data_url(large_bytes, 2000)
+    data_url, old_size, new_size = h._resize_image_to_data_url(
+        large_bytes, 2000)
     check("大きい画像はリサイズされる", data_url is not None, f"{old_size} → {new_size}")
     check("リサイズ後はMax辺が2000以下", max(new_size) <= 2000, str(new_size))
     check("data URL 形式が正しい", data_url.startswith("data:image/"))
@@ -123,7 +128,8 @@ else:
 print("\n[4] モックサーバーとの疎通確認")
 
 # モックサーバーをサブプロセスで起動
-venv_python = os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe")
+venv_python = os.path.join(os.path.dirname(
+    __file__), ".venv", "Scripts", "python.exe")
 if not os.path.exists(venv_python):
     venv_python = sys.executable
 
@@ -146,21 +152,25 @@ try:
         "model": "zai-org/GLM-OCR",
         "messages": [
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "https://example.com/test.png"}},
+                {"type": "image_url", "image_url": {
+                    "url": "https://example.com/test.png"}},
                 {"type": "text", "text": "OCRしてください"}
             ]}
         ],
         "max_tokens": 2048,
         "temperature": 0.0
     }
-    r = requests.post("http://localhost:8080/v1/chat/completions", json=payload, timeout=5)
+    r = requests.post(
+        "http://localhost:8080/v1/chat/completions", json=payload, timeout=5)
     check("chat/completions ステータス 200", r.status_code == 200)
     data = r.json()
     check("choices フィールドが存在する", "choices" in data)
-    check("content が文字列", isinstance(data["choices"][0]["message"]["content"], str))
+    check("content が文字列", isinstance(
+        data["choices"][0]["message"]["content"], str))
 
     # RunPod 互換 API
-    r2 = requests.post("http://localhost:8080/run", json={"input": {"url": "https://example.com/test.png"}}, timeout=5)
+    r2 = requests.post("http://localhost:8080/run",
+                       json={"input": {"url": "https://example.com/test.png"}}, timeout=5)
     check("RunPod /run ステータス 200", r2.status_code == 200)
     data2 = r2.json()
     check("status が COMPLETED", data2.get("status") == "COMPLETED")
